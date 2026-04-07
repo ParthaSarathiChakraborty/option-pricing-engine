@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.env/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (VERY IMPORTANT)
+data/
+*.csv
+*.xlsx
+*.parquet
+*.feather
+
+# OS
+.DS_Store
+
+# Logs/temp
+*.log
+*.tmp
+
+plots/
+.streamlit/
