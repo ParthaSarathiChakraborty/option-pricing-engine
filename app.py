@@ -33,23 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-# Patch yfinance session to avoid rate limiting on cloud deployments
-session = requests.Session()
-session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
-})
-retry = Retry(total=3, backoff_factor=1.5,
-              status_forcelist=[429, 500, 502, 503, 504])
-session.mount("https://", HTTPAdapter(max_retries=retry))
-
+from curl_cffi import requests as curl_requests
 
 # ─────────────────────────────────────────────
 # GLOBAL CSS
@@ -233,7 +217,7 @@ def fetch_option_data(ticker: str, n_expiries: int, cache_bust: str):
     zero openInterest and volume even for actively traded contracts,
     which was silently wiping out the entire dataset.
     """
-    tk = yf.Ticker(ticker, session=session)
+    tk = yf.Ticker(ticker, session=curl_requests.Session(impersonate="chrome110"))
     expiries = tk.options
     if not expiries:
         raise ValueError(f"No options found for {ticker}.")

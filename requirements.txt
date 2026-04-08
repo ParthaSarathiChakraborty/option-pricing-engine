@@ -6,3 +6,4 @@ plotly>=5.18.0
 pyarrow>=14.0.0
 streamlit>=1.32.0
 ipykernel>=6.0.0
+curl_cffi>=0.6.0
