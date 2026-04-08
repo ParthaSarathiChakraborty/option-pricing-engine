@@ -8,6 +8,7 @@ Run locally:
 """
 
 import datetime
+import io
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -273,7 +274,7 @@ def fetch_option_data(ticker: str, n_expiries: int, cache_bust: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def compute_ivs(demo_json: str, r: float):
-    demo_df = pd.read_json(demo_json)
+    demo_df = pd.read_json(io.StringIO(demo_json))
 
     def _row(row):
         iv   = bs_implied_vol_single(
