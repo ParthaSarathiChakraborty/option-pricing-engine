@@ -15,6 +15,7 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import yfinance as yf
+import time
 
 from utils import (
     bs_price,
@@ -225,17 +226,31 @@ def fetch_option_data(ticker: str, n_expiries: int, cache_bust: str):
 
     spot = float(tk.history(period="1d")["Close"].iloc[-1])
 
-    all_dfs = []
-    for e in expiries[:n_expiries]:
-        try:
-            chain        = tk.option_chain(e)
-            calls        = chain.calls.copy(); calls["type"] = "call"
-            puts         = chain.puts.copy();  puts["type"]  = "put"
-            df           = pd.concat([calls, puts], ignore_index=True, sort=False)
-            df["expiry"] = pd.to_datetime(e)
-            all_dfs.append(df)
-        except Exception:
+    import time
+
+all_dfs = []
+for e in expiries[:n_expiries]:
+    try:
+        chain = tk.option_chain(e)
+        calls = chain.calls.copy(); calls["type"] = "call"
+        puts  = chain.puts.copy();  puts["type"]  = "put"
+        df    = pd.concat([calls, puts], ignore_index=True, sort=False)
+
+        # Skip empty chains — happens when Yahoo rate limits silently
+        if len(df) == 0:
             continue
+
+        df["expiry"] = pd.to_datetime(e)
+        all_dfs.append(df)
+        time.sleep(0.3)   # small delay between requests to avoid throttling
+    except Exception:
+        continue
+
+    if not all_dfs:
+        raise ValueError(
+        "Yahoo Finance returned no data. This is usually a temporary "
+        "rate limit on cloud servers. Wait 2-3 minutes and try again."
+    )
 
     if not all_dfs:
         raise ValueError("No option chains returned from yfinance.")
@@ -415,8 +430,10 @@ if fetch_btn or st.session_state.opts is None:
                 f"|  Spot: **${spot:.2f}**"
             )
         except Exception as exc:
-            st.error(f"Failed to fetch data: {exc}")
-
+            st.error(
+                f"⚠️ {exc} — If this is a rate limit error, "
+                f"wait 2-3 minutes and click Fetch Live Data again."
+            )
 opts = st.session_state.opts
 spot = st.session_state.spot
 
