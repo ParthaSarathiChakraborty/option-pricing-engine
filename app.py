@@ -7,15 +7,16 @@ Run locally:
     streamlit run app.py
 """
 
-import datetime
 import io
+import time
+import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import yfinance as yf
-import time
+from curl_cffi import requests as curl_requests
 
 from utils import (
     bs_price,
@@ -34,8 +35,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-from curl_cffi import requests as curl_requests
 
 # ─────────────────────────────────────────────
 # GLOBAL CSS
@@ -212,48 +211,54 @@ def fetch_option_data(ticker: str, n_expiries: int, cache_bust: str):
     """
     Fetch and clean live option chain.
 
-    cache_bust is a timestamp string passed on every button press so
-    the cache is always bypassed on a manual fetch — no stale results.
+    — cache_bust: timestamp string passed on every button press so the
+      cache is always bypassed on a manual fetch — no stale results.
 
-    Liquidity filter is intentionally removed: yfinance regularly returns
-    zero openInterest and volume even for actively traded contracts,
-    which was silently wiping out the entire dataset.
+    — curl_cffi session: impersonates Chrome at TLS fingerprint level,
+      bypassing Yahoo Finance rate limiting on cloud server IPs.
+
+    — time.sleep(0.3): small delay between expiry fetches to stay under
+      Yahoo's request threshold.
+
+    — Empty chain guard: silent rate limiting returns empty DataFrames
+      without raising an exception; we skip those explicitly.
+
+    — No liquidity filter: yfinance returns zero OI/volume on active
+      contracts — that filter was silently wiping the entire dataset.
     """
-    tk = yf.Ticker(ticker, session=curl_requests.Session(impersonate="chrome110"))
+    session  = curl_requests.Session(impersonate="chrome110")
+    tk       = yf.Ticker(ticker, session=session)
     expiries = tk.options
+
     if not expiries:
         raise ValueError(f"No options found for {ticker}.")
 
     spot = float(tk.history(period="1d")["Close"].iloc[-1])
 
-    import time
+    all_dfs = []
+    for e in expiries[:n_expiries]:
+        try:
+            chain = tk.option_chain(e)
+            calls = chain.calls.copy(); calls["type"] = "call"
+            puts  = chain.puts.copy();  puts["type"]  = "put"
+            df    = pd.concat([calls, puts], ignore_index=True, sort=False)
 
-all_dfs = []
-for e in expiries[:n_expiries]:
-    try:
-        chain = tk.option_chain(e)
-        calls = chain.calls.copy(); calls["type"] = "call"
-        puts  = chain.puts.copy();  puts["type"]  = "put"
-        df    = pd.concat([calls, puts], ignore_index=True, sort=False)
+            # Skip silently empty chains — sign of rate limiting
+            if len(df) == 0:
+                continue
 
-        # Skip empty chains — happens when Yahoo rate limits silently
-        if len(df) == 0:
+            df["expiry"] = pd.to_datetime(e)
+            all_dfs.append(df)
+            time.sleep(0.3)   # stay under Yahoo's request threshold
+
+        except Exception:
             continue
-
-        df["expiry"] = pd.to_datetime(e)
-        all_dfs.append(df)
-        time.sleep(0.3)   # small delay between requests to avoid throttling
-    except Exception:
-        continue
 
     if not all_dfs:
         raise ValueError(
-        "Yahoo Finance returned no data. This is usually a temporary "
-        "rate limit on cloud servers. Wait 2-3 minutes and try again."
-    )
-
-    if not all_dfs:
-        raise ValueError("No option chains returned from yfinance.")
+            "Yahoo Finance returned no data. This is usually a temporary "
+            "rate limit on cloud servers — wait 2-3 minutes and try again."
+        )
 
     opts = pd.concat(all_dfs, ignore_index=True, sort=False)
 
@@ -277,10 +282,9 @@ for e in expiries[:n_expiries]:
     opts["moneyness"] = opts["strike"] / spot
 
     # ── minimal sanity filter only ───────────────────────────────────────────
-    # No liquidity filter — yfinance returns zero OI/volume on active contracts
     opts = opts[
-        (opts["mid"]    > 0)     &
-        (opts["strike"] > 0)     &
+        (opts["mid"]    > 0)    &
+        (opts["strike"] > 0)    &
         (opts["T"]      >= 1/365)
     ].reset_index(drop=True)
 
@@ -289,6 +293,11 @@ for e in expiries[:n_expiries]:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def compute_ivs(demo_json: str, r: float):
+    """
+    Compute implied vol and BS price for every row in the demo expiry.
+    Uses io.StringIO to wrap the JSON string — required by newer pandas
+    versions which no longer accept literal JSON strings directly.
+    """
     demo_df = pd.read_json(io.StringIO(demo_json))
 
     def _row(row):
@@ -412,19 +421,16 @@ st.divider()
 st.markdown("### Live Market Data")
 
 if "opts" not in st.session_state:
-    st.session_state.opts  = None
-    st.session_state.spot  = None
-    
+    st.session_state.opts = None
+    st.session_state.spot = None
+
 if fetch_btn or st.session_state.opts is None:
     with st.spinner(f"Fetching {ticker} option chain from Yahoo Finance..."):
         try:
-            # Timestamp busts the cache on every button press
             bust = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
             opts, spot = fetch_option_data(ticker, n_expiries, cache_bust=bust)
-            st.session_state.opts      = opts
-            st.session_state.spot      = spot
-            st.session_state.demo_df   = None
-            st.session_state.cache_key = None
+            st.session_state.opts = opts
+            st.session_state.spot = spot
             st.success(
                 f"✓  {ticker} — {len(opts):,} contracts loaded  "
                 f"|  Spot: **${spot:.2f}**"
@@ -434,6 +440,7 @@ if fetch_btn or st.session_state.opts is None:
                 f"⚠️ {exc} — If this is a rate limit error, "
                 f"wait 2-3 minutes and click Fetch Live Data again."
             )
+
 opts = st.session_state.opts
 spot = st.session_state.spot
 
@@ -446,22 +453,16 @@ expiries    = sorted(opts["expiry"].unique())
 expiry_strs = [str(e.date()) for e in expiries]
 sel_str     = st.selectbox("Select expiry", expiry_strs)
 
-# Guard: selectbox returns None for one rerun cycle before resolving
 if not sel_str:
     st.info("Select an expiry above to continue.")
     st.stop()
 
 demo_expiry = expiries[expiry_strs.index(sel_str)]
-demo_raw  = opts[opts["expiry"] == demo_expiry].copy().reset_index(drop=True)
-cache_key = f"{ticker}|{sel_str}|{r}"
+demo_raw    = opts[opts["expiry"] == demo_expiry].copy().reset_index(drop=True)
 
-if st.session_state.cache_key != cache_key:
-    with st.spinner("Computing implied volatilities..."):
-        demo_df = compute_ivs(demo_raw.to_json(), r)
-        st.session_state.demo_df   = demo_df
-        st.session_state.cache_key = cache_key
-else:
-    demo_df = st.session_state.demo_df
+# ── Compute IVs — fresh on every expiry change, cached by @st.cache_data ────
+with st.spinner("Computing implied volatilities..."):
+    demo_df = compute_ivs(demo_raw.to_json(), r)
 
 # ── Apply CRR & MC ───────────────────────────────────────────────────────────
 with st.spinner("Pricing with CRR & Monte Carlo..."):
@@ -484,11 +485,11 @@ with st.spinner("Pricing with CRR & Monte Carlo..."):
         )
         return pd.Series({"mc_price": p, "mc_se": se})
 
-    demo_df["binomial_price"]         = demo_df.apply(_bin, axis=1)
-    demo_df[["mc_price", "mc_se"]]    = demo_df.apply(_mc,  axis=1)
-    demo_df["bs_error"]               = demo_df["bs_price"]       - demo_df["mid"]
-    demo_df["bin_error"]              = demo_df["binomial_price"]  - demo_df["mid"]
-    demo_df["mc_error"]               = demo_df["mc_price"]        - demo_df["mid"]
+    demo_df["binomial_price"]        = demo_df.apply(_bin, axis=1)
+    demo_df[["mc_price", "mc_se"]]   = demo_df.apply(_mc,  axis=1)
+    demo_df["bs_error"]              = demo_df["bs_price"]      - demo_df["mid"]
+    demo_df["bin_error"]             = demo_df["binomial_price"] - demo_df["mid"]
+    demo_df["mc_error"]              = demo_df["mc_price"]       - demo_df["mid"]
 
 st.divider()
 
@@ -529,7 +530,7 @@ st.dataframe(
         "bs_error": "BS Err", "bin_error": "CRR Err",
         "mc_error": "MC Err", "iv_calc": "Impl. Vol",
     }),
-    use_container_width=True,
+    width="stretch",
     height=320,
 )
 
@@ -571,7 +572,7 @@ fig_err = px.scatter(
 fig_err.add_hline(y=0, line_dash="dash", line_color="#484f58", line_width=1.5)
 fig_err.update_layout(**PLOTLY_LAYOUT)
 fig_err.update_layout(title=f"{error_model} — Error vs Strike  ({sel_str})")
-st.plotly_chart(fig_err, use_container_width=True)
+st.plotly_chart(fig_err, width="stretch")
 
 st.divider()
 
@@ -633,7 +634,7 @@ fig_conv.update_layout(
     xaxis_title="Number of Paths",
     yaxis_title="Error ($)",
 )
-st.plotly_chart(fig_conv, use_container_width=True)
+st.plotly_chart(fig_conv, width="stretch")
 
 
 # ─────────────────────────────────────────────
