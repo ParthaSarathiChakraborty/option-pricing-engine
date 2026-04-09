@@ -16,7 +16,6 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import yfinance as yf
-from curl_cffi import requests as curl_requests
 
 from utils import (
     bs_price,
@@ -47,14 +46,12 @@ st.markdown("""
 html, body, [class*="css"], p, li, span, div {
     font-family: 'IBM Plex Sans', sans-serif !important;
 }
-
 [data-testid="stMetricValue"] {
     font-family: 'IBM Plex Mono', monospace !important;
     font-size: 1.45rem !important;
     color: #58a6ff !important;
     font-weight: 600 !important;
 }
-
 [data-testid="stMetricLabel"] {
     font-family: 'IBM Plex Mono', monospace !important;
     font-size: 0.72rem !important;
@@ -62,19 +59,16 @@ html, body, [class*="css"], p, li, span, div {
     letter-spacing: 0.07em !important;
     color: #8b949e !important;
 }
-
 [data-testid="metric-container"] {
     background: #161b22;
     border: 1px solid #30363d;
     border-radius: 10px;
     padding: 18px 20px !important;
 }
-
 [data-testid="stSidebar"] {
     background-color: #161b22 !important;
     border-right: 1px solid #30363d !important;
 }
-
 [data-testid="stSidebar"] .stMarkdown p {
     color: #8b949e !important;
     font-size: 0.78rem !important;
@@ -82,7 +76,6 @@ html, body, [class*="css"], p, li, span, div {
     letter-spacing: 0.06em;
     font-weight: 600;
 }
-
 h1 {
     font-family: 'IBM Plex Mono', monospace !important;
     font-size: 1.5rem !important;
@@ -92,7 +85,6 @@ h1 {
     padding-bottom: 14px;
     margin-bottom: 8px !important;
 }
-
 h2, h3 {
     font-family: 'IBM Plex Mono', monospace !important;
     font-size: 0.85rem !important;
@@ -103,18 +95,15 @@ h2, h3 {
     margin-top: 28px !important;
     margin-bottom: 6px !important;
 }
-
 hr {
     border: none !important;
     border-top: 1px solid #21262d !important;
     margin: 28px 0 !important;
 }
-
 [data-testid="stDataFrame"] {
     border: 1px solid #30363d !important;
     border-radius: 8px !important;
 }
-
 .stButton > button {
     background-color: #238636 !important;
     color: #ffffff !important;
@@ -131,13 +120,11 @@ hr {
     background-color: #2ea043 !important;
     border-color: #3fb950 !important;
 }
-
 [data-testid="stRadio"] label {
     font-family: 'IBM Plex Mono', monospace !important;
     font-size: 0.8rem !important;
     color: #c9d1d9 !important;
 }
-
 [data-testid="stSelectbox"] label,
 [data-testid="stNumberInput"] label,
 [data-testid="stSlider"] label,
@@ -148,7 +135,6 @@ hr {
     text-transform: uppercase !important;
     letter-spacing: 0.05em !important;
 }
-
 [data-testid="stCaptionContainer"] p {
     font-size: 0.8rem !important;
     color: #6e7681 !important;
@@ -203,7 +189,32 @@ PLOTLY_LAYOUT = dict(
 
 
 # ─────────────────────────────────────────────
-# CACHED DATA HELPERS
+# CORE FETCH LOGIC  (not cached — called inside cached wrapper)
+# ─────────────────────────────────────────────
+
+def _fetch_chain_with_retry(tk, expiry: str, max_retries: int = 3) -> pd.DataFrame:
+    """
+    Fetch one expiry's option chain with exponential backoff.
+    Returns an empty DataFrame if all retries fail.
+    """
+    for attempt in range(max_retries):
+        try:
+            chain = tk.option_chain(expiry)
+            calls = chain.calls.copy(); calls["type"] = "call"
+            puts  = chain.puts.copy();  puts["type"]  = "put"
+            df    = pd.concat([calls, puts], ignore_index=True, sort=False)
+            if len(df) > 0:
+                return df
+        except Exception:
+            pass
+        # Exponential backoff: 1s, 2s, 4s
+        if attempt < max_retries - 1:
+            time.sleep(2 ** attempt)
+    return pd.DataFrame()
+
+
+# ─────────────────────────────────────────────
+# CACHED FETCH
 # ─────────────────────────────────────────────
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -211,23 +222,16 @@ def fetch_option_data(ticker: str, n_expiries: int, cache_bust: str):
     """
     Fetch and clean live option chain.
 
-    — cache_bust: timestamp string passed on every button press so the
-      cache is always bypassed on a manual fetch — no stale results.
-
-    — curl_cffi session: impersonates Chrome at TLS fingerprint level,
-      bypassing Yahoo Finance rate limiting on cloud server IPs.
-
-    — time.sleep(0.3): small delay between expiry fetches to stay under
-      Yahoo's request threshold.
-
-    — Empty chain guard: silent rate limiting returns empty DataFrames
-      without raising an exception; we skip those explicitly.
-
-    — No liquidity filter: yfinance returns zero OI/volume on active
-      contracts — that filter was silently wiping the entire dataset.
+    KEY DESIGN DECISIONS:
+    - No custom session passed to yfinance. Newer yfinance (0.2.40+) uses
+      curl_cffi internally — passing an external session conflicts with its
+      own session management and causes option_chain() to return empty data
+      even though history() still works (different code path).
+    - Retry with exponential backoff per expiry handles transient rate limits.
+    - 0.5s sleep between expiries keeps request rate below Yahoo's threshold.
+    - cache_bust timestamp ensures every button press bypasses @st.cache_data.
     """
-    session  = curl_requests.Session(impersonate="chrome110")
-    tk       = yf.Ticker(ticker, session=session)
+    tk       = yf.Ticker(ticker)           # no session argument
     expiries = tk.options
 
     if not expiries:
@@ -235,29 +239,23 @@ def fetch_option_data(ticker: str, n_expiries: int, cache_bust: str):
 
     spot = float(tk.history(period="1d")["Close"].iloc[-1])
 
-    all_dfs = []
+    debug_log = []
+    all_dfs   = []
+
     for e in expiries[:n_expiries]:
-        try:
-            chain = tk.option_chain(e)
-            calls = chain.calls.copy(); calls["type"] = "call"
-            puts  = chain.puts.copy();  puts["type"]  = "put"
-            df    = pd.concat([calls, puts], ignore_index=True, sort=False)
-
-            # Skip silently empty chains — sign of rate limiting
-            if len(df) == 0:
-                continue
-
+        df = _fetch_chain_with_retry(tk, e)
+        if len(df) > 0:
             df["expiry"] = pd.to_datetime(e)
             all_dfs.append(df)
-            time.sleep(0.3)   # stay under Yahoo's request threshold
-
-        except Exception:
-            continue
+            debug_log.append(f"✓  {e}  →  {len(df)} rows")
+        else:
+            debug_log.append(f"✗  {e}  →  empty (skipped)")
+        time.sleep(0.5)    # polite delay between expiries
 
     if not all_dfs:
         raise ValueError(
-            "Yahoo Finance returned no data. This is usually a temporary "
-            "rate limit on cloud servers — wait 2-3 minutes and try again."
+            "All option chains returned empty. Yahoo Finance is rate limiting "
+            "this server IP. Wait 3-5 minutes and try again."
         )
 
     opts = pd.concat(all_dfs, ignore_index=True, sort=False)
@@ -281,23 +279,22 @@ def fetch_option_data(ticker: str, n_expiries: int, cache_bust: str):
     opts["spot"]      = spot
     opts["moneyness"] = opts["strike"] / spot
 
-    # ── minimal sanity filter only ───────────────────────────────────────────
+    # ── minimal sanity filter ────────────────────────────────────────────────
     opts = opts[
         (opts["mid"]    > 0)    &
         (opts["strike"] > 0)    &
         (opts["T"]      >= 1/365)
     ].reset_index(drop=True)
 
-    return opts, spot
+    return opts, spot, debug_log
 
+
+# ─────────────────────────────────────────────
+# CACHED IV COMPUTATION
+# ─────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
 def compute_ivs(demo_json: str, r: float):
-    """
-    Compute implied vol and BS price for every row in the demo expiry.
-    Uses io.StringIO to wrap the JSON string — required by newer pandas
-    versions which no longer accept literal JSON strings directly.
-    """
     demo_df = pd.read_json(io.StringIO(demo_json))
 
     def _row(row):
@@ -421,25 +418,27 @@ st.divider()
 st.markdown("### Live Market Data")
 
 if "opts" not in st.session_state:
-    st.session_state.opts = None
-    st.session_state.spot = None
+    st.session_state.opts      = None
+    st.session_state.spot      = None
+    st.session_state.debug_log = []
 
 if fetch_btn or st.session_state.opts is None:
-    with st.spinner(f"Fetching {ticker} option chain from Yahoo Finance..."):
+    with st.spinner(f"Fetching {ticker} option chain — this may take 30-60s..."):
         try:
             bust = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-            opts, spot = fetch_option_data(ticker, n_expiries, cache_bust=bust)
-            st.session_state.opts = opts
-            st.session_state.spot = spot
+            opts, spot, debug_log          = fetch_option_data(ticker, n_expiries, cache_bust=bust)
+            st.session_state.opts          = opts
+            st.session_state.spot          = spot
+            st.session_state.debug_log     = debug_log
             st.success(
                 f"✓  {ticker} — {len(opts):,} contracts loaded  "
                 f"|  Spot: **${spot:.2f}**"
             )
         except Exception as exc:
-            st.error(
-                f"⚠️ {exc} — If this is a rate limit error, "
-                f"wait 2-3 minutes and click Fetch Live Data again."
-            )
+            st.error(f"⚠️ {exc}")
+            if st.session_state.debug_log:
+                with st.expander("Debug — per-expiry fetch log"):
+                    st.code("\n".join(st.session_state.debug_log))
 
 opts = st.session_state.opts
 spot = st.session_state.spot
@@ -447,6 +446,11 @@ spot = st.session_state.spot
 if opts is None:
     st.info("👈  Click **↻ Fetch Live Data** in the sidebar to load options.")
     st.stop()
+
+# Debug expander — always available after a fetch so you can see what happened
+if st.session_state.debug_log:
+    with st.expander("Debug — per-expiry fetch log", expanded=False):
+        st.code("\n".join(st.session_state.debug_log))
 
 # ── Expiry selector ──────────────────────────────────────────────────────────
 expiries    = sorted(opts["expiry"].unique())
@@ -460,7 +464,7 @@ if not sel_str:
 demo_expiry = expiries[expiry_strs.index(sel_str)]
 demo_raw    = opts[opts["expiry"] == demo_expiry].copy().reset_index(drop=True)
 
-# ── Compute IVs — fresh on every expiry change, cached by @st.cache_data ────
+# ── Compute IVs ──────────────────────────────────────────────────────────────
 with st.spinner("Computing implied volatilities..."):
     demo_df = compute_ivs(demo_raw.to_json(), r)
 
@@ -487,9 +491,9 @@ with st.spinner("Pricing with CRR & Monte Carlo..."):
 
     demo_df["binomial_price"]        = demo_df.apply(_bin, axis=1)
     demo_df[["mc_price", "mc_se"]]   = demo_df.apply(_mc,  axis=1)
-    demo_df["bs_error"]              = demo_df["bs_price"]      - demo_df["mid"]
-    demo_df["bin_error"]             = demo_df["binomial_price"] - demo_df["mid"]
-    demo_df["mc_error"]              = demo_df["mc_price"]       - demo_df["mid"]
+    demo_df["bs_error"]              = demo_df["bs_price"]       - demo_df["mid"]
+    demo_df["bin_error"]             = demo_df["binomial_price"]  - demo_df["mid"]
+    demo_df["mc_error"]              = demo_df["mc_price"]        - demo_df["mid"]
 
 st.divider()
 
