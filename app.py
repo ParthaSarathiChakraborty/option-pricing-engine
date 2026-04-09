@@ -264,14 +264,18 @@ def fetch_option_data(ticker: str, n_expiries: int, cache_bust: str):
     for col in ["bid", "ask", "lastPrice", "volume", "openInterest"]:
         opts[col] = pd.to_numeric(opts.get(col), errors="coerce")
 
-    opts["mid"]          = opts[["bid", "ask"]].mean(axis=1).fillna(opts["lastPrice"])
+    opts["mid"] = opts[["bid", "ask"]].mean(axis=1)
+    # Fall back to lastPrice when mid is NaN OR zero (yfinance returns 0.0
+    # for bid/ask on many contracts — not NaN — so fillna alone misses these)
+    opts["mid"] = opts["mid"].where(opts["mid"] > 0, opts["lastPrice"])
+    opts["mid"] = opts["mid"].fillna(opts["lastPrice"])
     opts["volume"]       = opts["volume"].fillna(0)
     opts["openInterest"] = opts["openInterest"].fillna(0)
 
     # ── time to expiry ───────────────────────────────────────────────────────
     today          = pd.Timestamp.today().normalize()
     opts["T_days"] = (opts["expiry"] - today).dt.days
-    opts           = opts[opts["T_days"] > 0].copy()
+    opts           = opts[opts["T_days"] >= 0].copy()
     opts["T"]      = opts["T_days"] / 365.0
 
     # ── enrich ───────────────────────────────────────────────────────────────
