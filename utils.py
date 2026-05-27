@@ -7,10 +7,11 @@ Import from any notebook with: from utils import bs_price, bs_implied_vol_single
 Functions
 ---------
 safe_write_html       : Robust Plotly HTML saver with fallback dirs
-bs_price              : Black-Scholes pricer (numpy-based, vectorization-ready)
+bs_price              : Black-Scholes pricer (numpy-based, European only)
 bs_implied_vol_single : Implied vol solver via Brent's method
-binomial_price        : CRR Binomial Tree pricer (European)
-mc_price              : Monte Carlo GBM pricer with antithetic variates
+binomial_price        : CRR Binomial Tree — supports European AND American options
+mc_price              : Monte Carlo GBM pricer with antithetic variates (European)
+early_exercise_premium: Convenience function — American minus European binomial price
 """
 
 import os
@@ -29,7 +30,7 @@ def safe_write_html(fig, filename, preferred_dir="plots"):
     then ./plots, then the current working directory.
     """
     candidates = [preferred_dir, "plots", os.getcwd()]
-    last_exc = None
+    last_exc   = None
     for d in candidates:
         try:
             if d and not os.path.exists(d):
@@ -45,15 +46,15 @@ def safe_write_html(fig, filename, preferred_dir="plots"):
 
 
 # ─────────────────────────────────────────────
-# BLACK-SCHOLES
+# BLACK-SCHOLES  (European only)
 # ─────────────────────────────────────────────
 
 def bs_price(spot, K, T, r, sigma, option_type="call"):
     """
     Black-Scholes price for a European option.
 
-    Uses numpy throughout (vs math module) so it can be called
-    inside vectorized apply() operations without modification.
+    Uses numpy throughout so it is compatible with vectorised
+    apply() operations without modification.
 
     Parameters
     ----------
@@ -83,7 +84,8 @@ def bs_price(spot, K, T, r, sigma, option_type="call"):
 # IMPLIED VOLATILITY SOLVER
 # ─────────────────────────────────────────────
 
-def bs_implied_vol_single(market_price, spot, K, T, r, option_type="call", tol=1e-6, maxiter=100):
+def bs_implied_vol_single(market_price, spot, K, T, r,
+                           option_type="call", tol=1e-6, maxiter=100):
     """
     Solve for implied vol using Brent's method.
 
@@ -101,8 +103,8 @@ def bs_implied_vol_single(market_price, spot, K, T, r, option_type="call", tol=1
     try:
         fl, fh = f(low), f(high)
         if fl * fh > 0:
-            high = 10.0          # expand bracket once
-            fh = f(high)
+            high = 10.0
+            fh   = f(high)
             if fl * fh > 0:
                 return np.nan
         return float(brentq(f, low, high, xtol=tol, maxiter=maxiter))
@@ -111,15 +113,41 @@ def bs_implied_vol_single(market_price, spot, K, T, r, option_type="call", tol=1
 
 
 # ─────────────────────────────────────────────
-# BINOMIAL TREE (CRR)
+# BINOMIAL TREE (CRR)  — European & American
 # ─────────────────────────────────────────────
 
-def binomial_price(spot, K, T, r, sigma, steps=100, option_type="call"):
+def binomial_price(spot, K, T, r, sigma,
+                   steps=100, option_type="call", option_style="european"):
     """
-    Cox-Ross-Rubinstein Binomial Tree for European options.
+    Cox-Ross-Rubinstein Binomial Tree pricer.
 
-    Backward induction over `steps` time slices.
-    Returns np.nan if risk-neutral probability falls outside [0, 1].
+    Supports both European and American exercise styles.
+
+    Parameters
+    ----------
+    spot, K, T, r, sigma : floats
+    steps                : int — number of time steps (default 100)
+    option_type          : 'call' or 'put'
+    option_style         : 'european' or 'american'
+
+        European: holder can only exercise at expiry.
+        American: holder can exercise at any node during backward
+                  induction. At each node we take:
+                      max(continuation_value, exercise_value)
+                  This is the only difference from European pricing.
+
+    Returns
+    -------
+    float : option price, or np.nan on invalid inputs
+
+    Notes
+    -----
+    Early exercise of an American call is never optimal when there
+    are no dividends — the early exercise premium will be zero for
+    calls on non-dividend paying assets (call-put parity argument).
+    The premium is meaningful for American puts, especially deep ITM
+    puts close to expiry where interest on the strike exceeds the
+    remaining time value.
     """
     if T <= 0 or sigma <= 0 or spot <= 0 or K <= 0:
         return np.nan
@@ -132,28 +160,100 @@ def binomial_price(spot, K, T, r, sigma, steps=100, option_type="call"):
     if not (0.0 < p < 1.0):
         return np.nan
 
-    # Terminal asset prices (vectorised)
+    # ── Terminal asset prices (vectorised) ──────────────────────────
     j      = np.arange(steps + 1)
     prices = spot * (u ** j) * (d ** (steps - j))
 
-    # Payoffs at maturity
-    values = np.maximum(prices - K, 0.0) if option_type == "call" else np.maximum(K - prices, 0.0)
+    # ── Terminal payoffs ─────────────────────────────────────────────
+    if option_type == "call":
+        values = np.maximum(prices - K, 0.0)
+    else:
+        values = np.maximum(K - prices, 0.0)
 
-    # Backward induction
+    # ── Backward induction ───────────────────────────────────────────
     discount = np.exp(-r * dt)
-    for _ in range(steps):
-        values = discount * (p * values[1:] + (1.0 - p) * values[:-1])
+
+    for step in range(steps):
+        # Asset prices at this node level (steps - step - 1 remaining)
+        node_prices = spot * (u ** np.arange(steps - step)) * (d ** np.arange(steps - step - 1, -1, -1))
+
+        # Continuation value
+        continuation = discount * (p * values[1:] + (1.0 - p) * values[:-1])
+
+        if option_style == "american":
+            # Exercise value at each node
+            if option_type == "call":
+                exercise = np.maximum(node_prices - K, 0.0)
+            else:
+                exercise = np.maximum(K - node_prices, 0.0)
+
+            # American: take the best of hold vs exercise at every node
+            values = np.maximum(continuation, exercise)
+        else:
+            # European: no early exercise — continuation value only
+            values = continuation
 
     return float(values[0])
 
 
 # ─────────────────────────────────────────────
-# MONTE CARLO (GBM)
+# EARLY EXERCISE PREMIUM
 # ─────────────────────────────────────────────
 
-def mc_price(spot, K, T, r, sigma, n_paths=100_000, option_type="call", seed=None, antithetic=True):
+def early_exercise_premium(spot, K, T, r, sigma,
+                            steps=100, option_type="put"):
+    """
+    Compute the early exercise premium: American price − European price.
+
+    The premium is always >= 0 by no-arbitrage (an American option
+    is always worth at least as much as an equivalent European option).
+
+    For calls on non-dividend paying assets, this will be ~0 since
+    early exercise of calls is never optimal.
+
+    For puts, the premium is largest for:
+    - Deep ITM options (high intrinsic value, low time value)
+    - High interest rates (large opportunity cost of holding the put)
+    - Short maturities (less time value to sacrifice)
+
+    Parameters
+    ----------
+    spot, K, T, r, sigma : floats
+    steps                : int
+    option_type          : 'call' or 'put'
+
+    Returns
+    -------
+    (american_price, european_price, premium) : tuple of floats
+    """
+    american = binomial_price(spot, K, T, r, sigma,
+                              steps=steps, option_type=option_type,
+                              option_style="american")
+    european = binomial_price(spot, K, T, r, sigma,
+                              steps=steps, option_type=option_type,
+                              option_style="european")
+
+    if np.isnan(american) or np.isnan(european):
+        return np.nan, np.nan, np.nan
+
+    premium = float(american - european)
+    return float(american), float(european), max(premium, 0.0)
+
+
+# ─────────────────────────────────────────────
+# MONTE CARLO (GBM)  — European only
+# ─────────────────────────────────────────────
+
+def mc_price(spot, K, T, r, sigma,
+             n_paths=100_000, option_type="call",
+             seed=None, antithetic=True):
     """
     Monte Carlo pricer for European options under GBM.
+
+    Note: MC does not support American options in this implementation.
+    American options require simulation of the full path AND an optimal
+    stopping rule at each time step (Longstaff-Schwartz / LSM), which
+    is a significant extension beyond the current scope.
 
     Parameters
     ----------
@@ -170,22 +270,22 @@ def mc_price(spot, K, T, r, sigma, n_paths=100_000, option_type="call", seed=Non
                        so unpacking is always safe.
     """
     if T <= 0 or sigma <= 0 or spot <= 0 or K <= 0:
-        return np.nan, np.nan              # always return tuple
+        return np.nan, np.nan
 
-    rng = np.random.default_rng(seed)     # seed=None → fresh randomness each call
+    rng = np.random.default_rng(seed)
 
     if antithetic:
         half = n_paths // 2
         z    = rng.standard_normal(half)
         z    = np.concatenate([z, -z])
-        if len(z) < n_paths:              # handle odd n_paths
+        if len(z) < n_paths:
             z = np.concatenate([z, rng.standard_normal(1)])
     else:
         z = rng.standard_normal(n_paths)
 
     ST = spot * np.exp((r - 0.5 * sigma ** 2) * T + sigma * np.sqrt(T) * z)
 
-    payoffs = np.maximum(ST - K, 0.0) if option_type == "call" else np.maximum(K - ST, 0.0)
+    payoffs  = np.maximum(ST - K, 0.0) if option_type == "call" else np.maximum(K - ST, 0.0)
     discount = np.exp(-r * T)
 
     price   = discount * np.mean(payoffs)

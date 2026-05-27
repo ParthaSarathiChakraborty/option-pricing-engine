@@ -2,6 +2,7 @@
 app.py — Option Pricing Dashboard
 ===================================
 Streamlit app: fetch live option chain, price with BS / CRR / Monte Carlo.
+Supports both European and American option styles (American via CRR only).
 
 Run locally:
     streamlit run app.py
@@ -21,6 +22,7 @@ from utils import (
     bs_price,
     bs_implied_vol_single,
     binomial_price,
+    early_exercise_premium,
     mc_price,
 )
 
@@ -152,6 +154,7 @@ def badge(label: str, color: str) -> str:
         "green":  ("#1a3a2a", "#3fb950", "#3fb950"),
         "blue":   ("#0d2d5e", "#58a6ff", "#58a6ff"),
         "orange": ("#3d2000", "#f0883e", "#f0883e"),
+        "purple": ("#2d1a4a", "#a78bfa", "#a78bfa"),
     }
     bg, fg, border = colors.get(color, colors["blue"])
     return (
@@ -172,16 +175,23 @@ def info_box(text: str) -> None:
     )
 
 
+def warning_box(text: str) -> None:
+    st.markdown(
+        f"<div style='background:#3d200022;border-left:3px solid #f0883e;"
+        f"padding:10px 16px;border-radius:0 6px 6px 0;font-size:0.84rem;"
+        f"color:#8b949e;margin:10px 0 18px 0;line-height:1.55'>{text}</div>",
+        unsafe_allow_html=True,
+    )
+
+
 PLOTLY_LAYOUT = dict(
     template="plotly_dark",
     paper_bgcolor="#161b22",
     plot_bgcolor="#0d1117",
     font=dict(family="IBM Plex Mono", color="#c9d1d9", size=11),
     title_font=dict(size=13, color="#e6edf3"),
-    legend=dict(
-        bgcolor="#0d1117", bordercolor="#30363d",
-        borderwidth=1, font=dict(size=11),
-    ),
+    legend=dict(bgcolor="#0d1117", bordercolor="#30363d",
+                borderwidth=1, font=dict(size=11)),
     margin=dict(l=48, r=24, t=52, b=40),
     xaxis=dict(gridcolor="#21262d", linecolor="#30363d", zerolinecolor="#30363d"),
     yaxis=dict(gridcolor="#21262d", linecolor="#30363d", zerolinecolor="#30363d"),
@@ -189,14 +199,10 @@ PLOTLY_LAYOUT = dict(
 
 
 # ─────────────────────────────────────────────
-# CORE FETCH LOGIC  (not cached — called inside cached wrapper)
+# CACHED DATA HELPERS
 # ─────────────────────────────────────────────
 
 def _fetch_chain_with_retry(tk, expiry: str, max_retries: int = 3) -> pd.DataFrame:
-    """
-    Fetch one expiry's option chain with exponential backoff.
-    Returns an empty DataFrame if all retries fail.
-    """
     for attempt in range(max_retries):
         try:
             chain = tk.option_chain(expiry)
@@ -207,38 +213,19 @@ def _fetch_chain_with_retry(tk, expiry: str, max_retries: int = 3) -> pd.DataFra
                 return df
         except Exception:
             pass
-        # Exponential backoff: 1s, 2s, 4s
         if attempt < max_retries - 1:
             time.sleep(2 ** attempt)
     return pd.DataFrame()
 
 
-# ─────────────────────────────────────────────
-# CACHED FETCH
-# ─────────────────────────────────────────────
-
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_option_data(ticker: str, n_expiries: int, cache_bust: str):
-    """
-    Fetch and clean live option chain.
-
-    KEY DESIGN DECISIONS:
-    - No custom session passed to yfinance. Newer yfinance (0.2.40+) uses
-      curl_cffi internally — passing an external session conflicts with its
-      own session management and causes option_chain() to return empty data
-      even though history() still works (different code path).
-    - Retry with exponential backoff per expiry handles transient rate limits.
-    - 0.5s sleep between expiries keeps request rate below Yahoo's threshold.
-    - cache_bust timestamp ensures every button press bypasses @st.cache_data.
-    """
-    tk       = yf.Ticker(ticker)           # no session argument
+    tk       = yf.Ticker(ticker)
     expiries = tk.options
-
     if not expiries:
         raise ValueError(f"No options found for {ticker}.")
 
-    spot = float(tk.history(period="1d")["Close"].iloc[-1])
-
+    spot      = float(tk.history(period="1d")["Close"].iloc[-1])
     debug_log = []
     all_dfs   = []
 
@@ -250,40 +237,33 @@ def fetch_option_data(ticker: str, n_expiries: int, cache_bust: str):
             debug_log.append(f"✓  {e}  →  {len(df)} rows")
         else:
             debug_log.append(f"✗  {e}  →  empty (skipped)")
-        time.sleep(0.5)    # polite delay between expiries
+        time.sleep(0.5)
 
     if not all_dfs:
         raise ValueError(
-            "All option chains returned empty. Yahoo Finance is rate limiting "
-            "this server IP. Wait 3-5 minutes and try again."
+            "All chains returned empty. Yahoo Finance is rate limiting "
+            "this server. Wait 3-5 minutes and try again."
         )
 
     opts = pd.concat(all_dfs, ignore_index=True, sort=False)
 
-    # ── numeric coercion ────────────────────────────────────────────────────
     for col in ["bid", "ask", "lastPrice", "volume", "openInterest"]:
         opts[col] = pd.to_numeric(opts.get(col), errors="coerce")
 
-    opts["mid"] = opts[["bid", "ask"]].mean(axis=1)
-    # Fall back to lastPrice when mid is NaN OR zero (yfinance returns 0.0
-    # for bid/ask on many contracts — not NaN — so fillna alone misses these)
-    opts["mid"] = opts["mid"].where(opts["mid"] > 0, opts["lastPrice"])
-    opts["mid"] = opts["mid"].fillna(opts["lastPrice"])
+    opts["mid"]          = opts[["bid", "ask"]].mean(axis=1).fillna(opts["lastPrice"])
+    opts["mid"]          = opts["mid"].where(opts["mid"] > 0, opts["lastPrice"])
+    opts["mid"]          = opts["mid"].fillna(opts["lastPrice"])
     opts["volume"]       = opts["volume"].fillna(0)
     opts["openInterest"] = opts["openInterest"].fillna(0)
 
-    # ── time to expiry ───────────────────────────────────────────────────────
     today          = pd.Timestamp.today().normalize()
     opts["T_days"] = (opts["expiry"] - today).dt.days
     opts           = opts[opts["T_days"] >= 0].copy()
     opts["T"]      = opts["T_days"] / 365.0
-
-    # ── enrich ───────────────────────────────────────────────────────────────
-    opts["strike"]    = pd.to_numeric(opts["strike"], errors="coerce")
-    opts["spot"]      = spot
+    opts["strike"] = pd.to_numeric(opts["strike"], errors="coerce")
+    opts["spot"]   = spot
     opts["moneyness"] = opts["strike"] / spot
 
-    # ── minimal sanity filter ────────────────────────────────────────────────
     opts = opts[
         (opts["mid"]    > 0)    &
         (opts["strike"] > 0)    &
@@ -292,10 +272,6 @@ def fetch_option_data(ticker: str, n_expiries: int, cache_bust: str):
 
     return opts, spot, debug_log
 
-
-# ─────────────────────────────────────────────
-# CACHED IV COMPUTATION
-# ─────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
 def compute_ivs(demo_json: str, r: float):
@@ -307,10 +283,8 @@ def compute_ivs(demo_json: str, r: float):
             row["T"], r, option_type=row["type"],
         )
         sig  = iv if not np.isnan(iv) else 0.2
-        bs_p = bs_price(
-            row["spot"], row["strike"], row["T"], r,
-            sig, option_type=row["type"],
-        )
+        bs_p = bs_price(row["spot"], row["strike"], row["T"], r,
+                        sig, option_type=row["type"])
         return pd.Series({"iv_calc": iv, "bs_price": bs_p})
 
     demo_df[["iv_calc", "bs_price"]] = demo_df.apply(_row, axis=1)
@@ -353,6 +327,20 @@ with st.sidebar:
                                    step=0.01, format="%.2f")
     manual_type  = st.selectbox("Option type", ["call", "put"])
 
+    # ── Option style selector ────────────────────────────────────────
+    st.markdown("**Option Style**")
+    option_style = st.radio(
+        "Exercise style",
+        ["European", "American"],
+        horizontal=True,
+        help=(
+            "European: exercise at expiry only.\n"
+            "American: exercise at any time — priced via CRR binomial tree.\n"
+            "Note: BS and MC price European options only."
+        ),
+    )
+    option_style_key = option_style.lower()
+
     st.divider()
 
     st.markdown("**Model Settings**")
@@ -374,10 +362,11 @@ with st.sidebar:
 
 st.markdown("<h1>📈 Option Pricing Dashboard</h1>", unsafe_allow_html=True)
 
-b1, b2, b3, _ = st.columns([1, 1, 1, 3])
+b1, b2, b3, b4, _ = st.columns([1, 1, 1, 1.2, 2])
 b1.markdown(badge("BLACK-SCHOLES", "green"),  unsafe_allow_html=True)
 b2.markdown(badge("CRR BINOMIAL",  "blue"),   unsafe_allow_html=True)
 b3.markdown(badge("MONTE CARLO",   "orange"), unsafe_allow_html=True)
+b4.markdown(badge(f"EXERCISE: {option_style.upper()}", "purple"), unsafe_allow_html=True)
 st.markdown("<br>", unsafe_allow_html=True)
 
 
@@ -388,29 +377,65 @@ st.markdown("<br>", unsafe_allow_html=True)
 st.markdown("### Single Option Pricer")
 info_box(
     "Price one option with all three models using the sidebar inputs. "
-    "Adjust spot, strike, vol, or maturity and prices update instantly."
+    "Adjust spot, strike, vol, or maturity and prices update instantly. "
+    "Switch between European and American exercise style using the sidebar toggle."
 )
 
-bs_val        = bs_price(manual_spot, manual_K, manual_T, r,
-                          manual_sigma, option_type=manual_type)
-bin_val       = binomial_price(manual_spot, manual_K, manual_T, r,
-                                manual_sigma, steps=crr_steps,
-                                option_type=manual_type)
+# BS — European only
+bs_val = bs_price(manual_spot, manual_K, manual_T, r,
+                  manual_sigma, option_type=manual_type)
+
+# CRR — supports both styles
+bin_val = binomial_price(manual_spot, manual_K, manual_T, r,
+                         manual_sigma, steps=crr_steps,
+                         option_type=manual_type,
+                         option_style=option_style_key)
+
+# MC — European only
 mc_val, mc_se = mc_price(manual_spot, manual_K, manual_T, r,
                           manual_sigma, n_paths=mc_paths_actual,
                           option_type=manual_type, seed=42)
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Black-Scholes", f"${bs_val:.4f}"  if not np.isnan(bs_val)  else "—")
-col2.metric("CRR Binomial",  f"${bin_val:.4f}" if not np.isnan(bin_val) else "—")
-col3.metric("Monte Carlo",   f"${mc_val:.4f}"  if not np.isnan(mc_val)  else "—")
-col4.metric("MC Std Error",  f"${mc_se:.5f}"   if not np.isnan(mc_se)   else "—")
+col1.metric("Black-Scholes (EUR)", f"${bs_val:.4f}"  if not np.isnan(bs_val)  else "—")
+col2.metric(f"CRR ({option_style[:3].upper()})",
+            f"${bin_val:.4f}" if not np.isnan(bin_val) else "—")
+col3.metric("Monte Carlo (EUR)",   f"${mc_val:.4f}"  if not np.isnan(mc_val)  else "—")
+col4.metric("MC Std Error",        f"${mc_se:.5f}"   if not np.isnan(mc_se)   else "—")
 
+# Diffs
 if not any(np.isnan(v) for v in [bs_val, bin_val, mc_val]):
     st.markdown("<br>", unsafe_allow_html=True)
     d1, d2, *_ = st.columns(4)
     d1.metric("|BS − CRR|", f"${abs(bs_val - bin_val):.5f}")
     d2.metric("|BS − MC|",  f"${abs(bs_val - mc_val):.5f}")
+
+# American early exercise premium display
+if option_style_key == "american":
+    am_val, eur_val, prem = early_exercise_premium(
+        manual_spot, manual_K, manual_T, r,
+        manual_sigma, steps=crr_steps, option_type=manual_type
+    )
+    if not np.isnan(prem):
+        st.markdown("<br>", unsafe_allow_html=True)
+        ep1, ep2, ep3 = st.columns(3)
+        ep1.metric("CRR American",         f"${am_val:.4f}")
+        ep2.metric("CRR European",         f"${eur_val:.4f}")
+        ep3.metric("Early Exercise Premium", f"${prem:.5f}",
+                   help="American − European. Always ≥ 0. "
+                        "Non-zero primarily for deep ITM puts.")
+        if manual_type == "call" and prem < 0.001:
+            warning_box(
+                "Early exercise premium ≈ 0 for this call — consistent with theory. "
+                "On a non-dividend paying asset it is never optimal to exercise a call early."
+            )
+        elif prem > 0.01:
+            info_box(
+                f"Early exercise premium of ${prem:.4f} indicates that at some nodes during "
+                f"backward induction, immediate exercise dominates holding. "
+                f"This is most common for deep ITM puts where interest on the strike "
+                f"exceeds the remaining time value."
+            )
 
 st.divider()
 
@@ -430,10 +455,10 @@ if fetch_btn or st.session_state.opts is None:
     with st.spinner(f"Fetching {ticker} option chain — this may take 30-60s..."):
         try:
             bust = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-            opts, spot, debug_log          = fetch_option_data(ticker, n_expiries, cache_bust=bust)
-            st.session_state.opts          = opts
-            st.session_state.spot          = spot
-            st.session_state.debug_log     = debug_log
+            opts, spot, debug_log      = fetch_option_data(ticker, n_expiries, cache_bust=bust)
+            st.session_state.opts      = opts
+            st.session_state.spot      = spot
+            st.session_state.debug_log = debug_log
             st.success(
                 f"✓  {ticker} — {len(opts):,} contracts loaded  "
                 f"|  Spot: **${spot:.2f}**"
@@ -451,12 +476,11 @@ if opts is None:
     st.info("👈  Click **↻ Fetch Live Data** in the sidebar to load options.")
     st.stop()
 
-# Debug expander — always available after a fetch so you can see what happened
 if st.session_state.debug_log:
     with st.expander("Debug — per-expiry fetch log", expanded=False):
         st.code("\n".join(st.session_state.debug_log))
 
-# ── Expiry selector ──────────────────────────────────────────────────────────
+# Expiry selector
 expiries    = sorted(opts["expiry"].unique())
 expiry_strs = [str(e.date()) for e in expiries]
 sel_str     = st.selectbox("Select expiry", expiry_strs)
@@ -468,19 +492,20 @@ if not sel_str:
 demo_expiry = expiries[expiry_strs.index(sel_str)]
 demo_raw    = opts[opts["expiry"] == demo_expiry].copy().reset_index(drop=True)
 
-# ── Compute IVs ──────────────────────────────────────────────────────────────
+# Compute IVs
 with st.spinner("Computing implied volatilities..."):
     demo_df = compute_ivs(demo_raw.to_json(), r)
 
-# ── Apply CRR & MC ───────────────────────────────────────────────────────────
+# Apply CRR (European) + MC
 with st.spinner("Pricing with CRR & Monte Carlo..."):
 
-    def _bin(row):
+    def _bin_eur(row):
         if pd.isna(row["iv_calc"]):
             return np.nan
         return binomial_price(
             row["spot"], row["strike"], row["T"], r,
-            row["iv_calc"], steps=crr_steps, option_type=row["type"],
+            row["iv_calc"], steps=crr_steps,
+            option_type=row["type"], option_style="european",
         )
 
     def _mc(row):
@@ -493,11 +518,25 @@ with st.spinner("Pricing with CRR & Monte Carlo..."):
         )
         return pd.Series({"mc_price": p, "mc_se": se})
 
-    demo_df["binomial_price"]        = demo_df.apply(_bin, axis=1)
-    demo_df[["mc_price", "mc_se"]]   = demo_df.apply(_mc,  axis=1)
-    demo_df["bs_error"]              = demo_df["bs_price"]       - demo_df["mid"]
-    demo_df["bin_error"]             = demo_df["binomial_price"]  - demo_df["mid"]
-    demo_df["mc_error"]              = demo_df["mc_price"]        - demo_df["mid"]
+    demo_df["binomial_eur"]           = demo_df.apply(_bin_eur, axis=1)
+    demo_df[["mc_price", "mc_se"]]    = demo_df.apply(_mc,      axis=1)
+    demo_df["bs_error"]               = demo_df["bs_price"]    - demo_df["mid"]
+    demo_df["bin_error"]              = demo_df["binomial_eur"] - demo_df["mid"]
+    demo_df["mc_error"]               = demo_df["mc_price"]     - demo_df["mid"]
+
+# Apply CRR American + early exercise premium
+with st.spinner("Computing American prices & early exercise premiums..."):
+
+    def _early_ex(row):
+        if pd.isna(row["iv_calc"]) or row["T"] <= 0:
+            return pd.Series({"binomial_am": np.nan, "ee_premium": np.nan})
+        am, eu, prem = early_exercise_premium(
+            row["spot"], row["strike"], row["T"], r,
+            row["iv_calc"], steps=crr_steps, option_type=row["type"],
+        )
+        return pd.Series({"binomial_am": am, "ee_premium": prem})
+
+    demo_df[["binomial_am", "ee_premium"]] = demo_df.apply(_early_ex, axis=1)
 
 st.divider()
 
@@ -508,33 +547,38 @@ st.divider()
 
 st.markdown("### Three-Model Comparison")
 info_box(
-    "All three models priced using market-implied vol as σ. "
-    "MAE vs market mid shown per model — lower is better."
+    "All models priced using market-implied vol as σ. "
+    "BS and MC price European options only. "
+    "CRR prices both styles — Early Exercise Premium = American − European."
 )
 
 mae = lambda x: float(np.nanmean(np.abs(x)))
-c1, c2, c3 = st.columns(3)
-c1.metric("MAE — Black-Scholes", f"${mae(demo_df['bs_error']):.5f}")
-c2.metric("MAE — CRR Binomial",  f"${mae(demo_df['bin_error']):.5f}")
-c3.metric("MAE — Monte Carlo",   f"${mae(demo_df['mc_error']):.5f}")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("MAE — Black-Scholes",   f"${mae(demo_df['bs_error']):.5f}")
+c2.metric("MAE — CRR (European)",  f"${mae(demo_df['bin_error']):.5f}")
+c3.metric("MAE — Monte Carlo",     f"${mae(demo_df['mc_error']):.5f}")
+c4.metric("Avg EE Premium",
+          f"${demo_df['ee_premium'].mean():.5f}"
+          if demo_df['ee_premium'].notna().any() else "—")
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-display_cols = ["strike", "type", "mid", "bs_price", "binomial_price",
-                "mc_price", "bs_error", "bin_error", "mc_error", "iv_calc"]
+display_cols = ["strike", "type", "mid", "bs_price", "binomial_eur",
+                "binomial_am", "ee_premium", "mc_price",
+                "bs_error", "bin_error", "mc_error", "iv_calc"]
 available    = [c for c in display_cols if c in demo_df.columns]
 table_df     = demo_df[available].dropna(subset=["bs_price"]).copy()
 
-for col in ["mid", "bs_price", "binomial_price", "mc_price",
-            "bs_error", "bin_error", "mc_error", "iv_calc"]:
-    if col in table_df.columns:
+for col in available:
+    if col not in ["strike", "type"]:
         table_df[col] = table_df[col].round(4)
 
 st.dataframe(
     table_df.rename(columns={
         "strike": "Strike", "type": "Type",
-        "mid": "Mid (Mkt)", "bs_price": "BS",
-        "binomial_price": "CRR", "mc_price": "MC",
+        "mid": "Mid (Mkt)", "bs_price": "BS (EUR)",
+        "binomial_eur": "CRR (EUR)", "binomial_am": "CRR (AM)",
+        "ee_premium": "EE Premium", "mc_price": "MC (EUR)",
         "bs_error": "BS Err", "bin_error": "CRR Err",
         "mc_error": "MC Err", "iv_calc": "Impl. Vol",
     }),
@@ -546,7 +590,47 @@ st.divider()
 
 
 # ─────────────────────────────────────────────
-# SECTION 4 — ERROR VS STRIKE
+# SECTION 4 — EARLY EXERCISE PREMIUM
+# ─────────────────────────────────────────────
+
+st.markdown("### Early Exercise Premium")
+info_box(
+    "American option price minus European option price (CRR tree). "
+    "Always ≥ 0 by no-arbitrage. For calls on non-dividend paying assets this is ~0. "
+    "Premium is largest for deep ITM puts where interest on the strike exceeds remaining time value."
+)
+
+prem_df = demo_df.dropna(subset=["ee_premium"]).copy()
+
+# Split calls vs puts for annotation
+calls_prem = prem_df[prem_df["type"] == "call"]["ee_premium"]
+puts_prem  = prem_df[prem_df["type"] == "put"]["ee_premium"]
+
+p1, p2, p3, p4 = st.columns(4)
+p1.metric("Calls with EE Premium > 0",    f"{(calls_prem > 0.001).sum()}")
+p2.metric("Puts with EE Premium > 0",     f"{(puts_prem  > 0.001).sum()}")
+p3.metric("Max Put Premium",              f"${puts_prem.max():.4f}" if len(puts_prem) > 0 else "—")
+p4.metric("Max Call Premium",             f"${calls_prem.max():.4f}" if len(calls_prem) > 0 else "—")
+
+fig_prem = px.scatter(
+    prem_df,
+    x="strike", y="ee_premium",
+    color="type",
+    color_discrete_map={"call": "#58a6ff", "put": "#f0883e"},
+    size="mid", size_max=14, opacity=0.80,
+    labels={"ee_premium": "EE Premium (AM - EUR, $)",
+            "strike": "Strike", "type": "Type"},
+)
+fig_prem.add_hline(y=0, line_dash="dash", line_color="#484f58", line_width=1.5)
+fig_prem.update_layout(**PLOTLY_LAYOUT)
+fig_prem.update_layout(title=f"Early Exercise Premium by Strike  ({sel_str})")
+st.plotly_chart(fig_prem, width="stretch")
+
+st.divider()
+
+
+# ─────────────────────────────────────────────
+# SECTION 5 — ERROR VS STRIKE
 # ─────────────────────────────────────────────
 
 st.markdown("### Pricing Error vs Strike")
@@ -557,26 +641,37 @@ info_box(
 
 error_model = st.radio(
     "Select model",
-    ["Black-Scholes", "CRR Binomial", "Monte Carlo"],
+    ["Black-Scholes", "CRR (European)", "CRR (American)", "Monte Carlo"],
     horizontal=True,
 )
 error_col = {
-    "Black-Scholes": "bs_error",
-    "CRR Binomial":  "bin_error",
-    "Monte Carlo":   "mc_error",
+    "Black-Scholes":    "bs_error",
+    "CRR (European)":   "bin_error",
+    "CRR (American)":   None,
+    "Monte Carlo":      "mc_error",
 }[error_model]
 
-scatter_df = demo_df.dropna(subset=[error_col]).copy()
+if error_col is None:
+    # American error vs market
+    demo_df["am_error"] = demo_df["binomial_am"] - demo_df["mid"]
+    scatter_df = demo_df.dropna(subset=["am_error"]).copy()
+    fig_err = px.scatter(
+        scatter_df, x="strike", y="am_error",
+        color="type",
+        color_discrete_map={"call": "#58a6ff", "put": "#f0883e"},
+        size="mid", size_max=14, opacity=0.80,
+        labels={"am_error": "Error (model - mid)", "strike": "Strike", "type": "Type"},
+    )
+else:
+    scatter_df = demo_df.dropna(subset=[error_col]).copy()
+    fig_err = px.scatter(
+        scatter_df, x="strike", y=error_col,
+        color="type",
+        color_discrete_map={"call": "#58a6ff", "put": "#f0883e"},
+        size="mid", size_max=14, opacity=0.80,
+        labels={error_col: "Error (model - mid)", "strike": "Strike", "type": "Type"},
+    )
 
-fig_err = px.scatter(
-    scatter_df,
-    x="strike", y=error_col,
-    color="type",
-    color_discrete_map={"call": "#58a6ff", "put": "#f0883e"},
-    size="mid", size_max=14,
-    opacity=0.80,
-    labels={error_col: "Error (model − mid)", "strike": "Strike", "type": "Type"},
-)
 fig_err.add_hline(y=0, line_dash="dash", line_color="#484f58", line_width=1.5)
 fig_err.update_layout(**PLOTLY_LAYOUT)
 fig_err.update_layout(title=f"{error_model} — Error vs Strike  ({sel_str})")
@@ -586,12 +681,12 @@ st.divider()
 
 
 # ─────────────────────────────────────────────
-# SECTION 5 — MC CONVERGENCE
+# SECTION 6 — MC CONVERGENCE
 # ─────────────────────────────────────────────
 
 st.markdown("### Monte Carlo Convergence")
 info_box(
-    "How |MC − BS| and standard error decay as path count increases. "
+    "How |MC - BS| and standard error decay as path count increases. "
     "Computed on the nearest ATM contract for the selected expiry."
 )
 
@@ -625,14 +720,11 @@ with st.spinner("Running convergence study..."):
 
 fig_conv = go.Figure()
 fig_conv.add_trace(go.Scatter(
-    x=paths_list, y=errs,
-    mode="lines+markers", name="|MC − BS|",
-    line=dict(color="#f0883e", width=2.5),
-    marker=dict(size=8, symbol="circle"),
+    x=paths_list, y=errs, mode="lines+markers", name="|MC - BS|",
+    line=dict(color="#f0883e", width=2.5), marker=dict(size=8, symbol="circle"),
 ))
 fig_conv.add_trace(go.Scatter(
-    x=paths_list, y=ses,
-    mode="lines+markers", name="Std Error",
+    x=paths_list, y=ses, mode="lines+markers", name="Std Error",
     line=dict(color="#58a6ff", width=2.5, dash="dot"),
     marker=dict(size=8, symbol="diamond"),
 ))
@@ -654,7 +746,7 @@ st.markdown(
     "<p style='text-align:center;font-family:IBM Plex Mono,monospace;"
     "font-size:0.7rem;color:#484f58;margin:4px 0 20px 0'>"
     "Live data via yfinance &nbsp;·&nbsp; "
-    "Models: Black-Scholes &nbsp;·&nbsp; CRR Binomial &nbsp;·&nbsp; Monte Carlo GBM<br>"
+    "Models: Black-Scholes · CRR Binomial (European & American) · Monte Carlo GBM<br>"
     "For educational purposes only — not financial advice."
     "</p>",
     unsafe_allow_html=True,
